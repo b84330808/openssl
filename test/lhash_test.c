@@ -185,6 +185,74 @@ end:
     return testresult;
 }
 
+static unsigned long raw_int_hash(const void *p)
+{
+    return int_hash(p);
+}
+
+static int raw_int_cmp(const void *p, const void *q)
+{
+    return int_cmp(p, q);
+}
+
+static void raw_int_doall(void *v)
+{
+    int_doall(v);
+}
+
+static void raw_int_doall_arg(void *v, void *arg)
+{
+    int_doall_arg(v, arg);
+}
+
+/*
+ * A table created with OPENSSL_LH_new() rather than lh_TYPE_new() has no
+ * thunks set.  OPENSSL_LH_doall() and OPENSSL_LH_doall_arg() must still call
+ * the supplied callback for every item.
+ */
+static int test_raw_lhash_doall(void)
+{
+    OPENSSL_LHASH *h = OPENSSL_LH_new(raw_int_hash, raw_int_cmp);
+    unsigned int i;
+    int testresult = 0;
+
+    if (!TEST_ptr(h))
+        goto end;
+
+    for (i = 0; i < n_int_tests; i++)
+        if (!TEST_ptr_null(OPENSSL_LH_insert(h, int_tests + i)))
+            goto end;
+    if (!TEST_size_t_eq((size_t)OPENSSL_LH_num_items(h), n_int_tests))
+        goto end;
+
+    memset(int_found, 0, sizeof(int_found));
+    int_not_found = 0;
+    OPENSSL_LH_doall(h, raw_int_doall);
+    if (!TEST_int_eq(int_not_found, 0))
+        goto end;
+    for (i = 0; i < n_int_tests; i++)
+        if (!TEST_int_eq(int_found[i], 1)) {
+            TEST_info("raw lhash doall %d", i);
+            goto end;
+        }
+
+    memset(int_found, 0, sizeof(int_found));
+    int_not_found = 0;
+    OPENSSL_LH_doall_arg(h, raw_int_doall_arg, int_found);
+    if (!TEST_int_eq(int_not_found, 0))
+        goto end;
+    for (i = 0; i < n_int_tests; i++)
+        if (!TEST_int_eq(int_found[i], 1)) {
+            TEST_info("raw lhash doall arg %d", i);
+            goto end;
+        }
+
+    testresult = 1;
+end:
+    OPENSSL_LH_free(h);
+    return testresult;
+}
+
 static int int_filter_all(HT_VALUE *v, void *arg)
 {
     return 1;
@@ -918,6 +986,7 @@ end:
 int setup_tests(void)
 {
     ADD_TEST(test_int_lhash);
+    ADD_TEST(test_raw_lhash_doall);
     ADD_TEST(test_stress);
     ADD_ALL_TESTS(test_int_hashtable, 2);
     ADD_ALL_TESTS(test_hashtable_stress, 4);

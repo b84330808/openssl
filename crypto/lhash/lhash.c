@@ -203,10 +203,22 @@ static void doall_util_fn(OPENSSL_LHASH *lh, int use_arg,
         a = lh->b[i];
         while (a != NULL) {
             n = a->next;
-            if (use_arg)
-                wfunc_arg(a->data, arg, func_arg);
-            else
-                wfunc(a->data, func);
+            /*
+             * Tables created by OPENSSL_LH_new() directly, rather than
+             * via lh_TYPE_new(), have no thunks: call the callback as is,
+             * just as getrn() does for the hash and compare functions.
+             */
+            if (use_arg) {
+                if (wfunc_arg != NULL)
+                    wfunc_arg(a->data, arg, func_arg);
+                else
+                    func_arg(a->data, arg);
+            } else {
+                if (wfunc != NULL)
+                    wfunc(a->data, func);
+                else
+                    func(a->data);
+            }
             a = n;
         }
     }
