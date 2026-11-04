@@ -34,7 +34,7 @@
 |---|--------|----------|----------------|--------|
 | 1 | `fix/lhash-doall-null-thunk` | `9ebdf9727e367b23e333ce462fad6cded3e12242` | https://github.com/openssl/openssl/issues/33496 | fail-before / pass-after verified |
 | 2 | `fix/x509-cursor-int-max` | `d400d7558f862ea3b4a044a4de1287cc90d3933b` | https://github.com/openssl/openssl/issues/33498 | fail-before / pass-after verified |
-| 3 | `fix/ec-keygen-order-one` | `7c3f3caf893f29a1ef941156304da99b4675203b` | https://github.com/openssl/openssl/issues/33497 | fail-before (hang) / pass-after verified |
+| 3 | `fix/ec-keygen-order-one` | `c6436ca8f11417db69f3b17f0cbb79152e4814ac` | https://github.com/openssl/openssl/issues/33497 | fail-before (hang) / pass-after verified |
 
 Each branch is one commit on top of the upstream base above, independent of
 the others.
@@ -278,7 +278,7 @@ no conflicts.
 ### Fix 3: `EC_KEY_generate_key()` loops forever for a group order of 1
 
 - Branch: `fix/ec-keygen-order-one`
-- SHA: `7c3f3caf893f29a1ef941156304da99b4675203b`
+- SHA: `c6436ca8f11417db69f3b17f0cbb79152e4814ac`
 - Files: `crypto/ec/ec_key.c`, `test/ectest.c`
 - Kind: unbounded loop (100% CPU, never returns) in key generation on
   parameters an application can build with `EC_GROUP_set_generator()`.
@@ -314,7 +314,8 @@ protected by MIN_ECDSA_SIGN_ORDERBITS.)
 
 A new test (degenerate_order_keygen_test in test/ectest.c) builds an order-1
 group and an order-2 group with the SM2 range flag set, and checks that
-EC_KEY_generate_key() fails for both. Without the change both iterations hang.
+EC_KEY_generate_key() fails with EC_R_INVALID_GROUP_ORDER for both. Without
+the change both iterations hang.
 
 Fixes: #33497
 
@@ -477,12 +478,26 @@ $ make test TESTS="test_internal_sm2 test_gensm2 test_internal_keymgmt test_evp_
 Files=5, Tests=123 ... Result: PASS
 ```
 
+These two runs were on the first version of the commit (`7c3f3caf89`). The
+current head `c6436ca8f1` changes only `test/ectest.c`: the negative test also
+checks that the error reason is `EC_R_INVALID_GROUP_ORDER`. After that change,
+`make test TESTS=test_ec V=1` gives `ok 20 - degenerate_order_keygen_test ...
+Result: PASS`.
+
 ## Fix 1 regression run
 
-Pending in the cloud session at the time of this push:
-`make test TESTS="test_lhash test_internal_* test_ca test_req test_x509 test_cms test_evp test_ssl_old test_sslapi test_provider* test_store test_conf*" HARNESS_JOBS=4`
-on `fix/lhash-doall-null-thunk` (ASan+UBSan). If this section still says
-"pending", the session ended before the run finished, so run it yourself.
+On `fix/lhash-doall-null-thunk` (ASan+UBSan):
+
+```
+$ make test TESTS="test_lhash test_internal_* test_ca test_req test_x509 test_cms test_evp test_ssl_old test_sslapi test_provider* test_store test_conf*" HARNESS_JOBS=4
+02-test_lhash.t ok, 80-test_ca.t ok (TXT_DB user), 25-test_req.t ok, 25-test_x509.t ok,
+90-test_sslapi.t ok, 80-test_cms.t ok, 80-test_ssl_old.t ok, 30-test_evp.t ok,
+90-test_store.t ok, 04-test_conf.t ok, 04-test_provider*.t ok, 30-test_provider_status.t ok,
+02/03-test_internal_*.t ok (exts, ctype, context, keymgmt, provider, asn1_dsa, bn, chacha,
+curve25519, ec, curve448, mdc2, ml_dsa, ml_kem, modes, namemap, poly1305,
+rsa_sp800_56b, siphash, ffc, sm2, sm3, ssl_cert_table, x509, sm4, asn1)
+Files=43, Tests=766 ... Result: PASS
+```
 
 ## Not done in the cloud session
 
