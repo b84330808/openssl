@@ -34,10 +34,16 @@
 |---|--------|----------|----------------|--------|
 | 1 | `fix/lhash-doall-null-thunk` | `9ebdf9727e367b23e333ce462fad6cded3e12242` | https://github.com/openssl/openssl/issues/33496 | fail-before / pass-after verified |
 | 2 | `fix/x509-cursor-int-max` | `d400d7558f862ea3b4a044a4de1287cc90d3933b` | https://github.com/openssl/openssl/issues/33498 | fail-before / pass-after verified |
+| 3 | `fix/ec-keygen-order-one` | `7c3f3caf893f29a1ef941156304da99b4675203b` | https://github.com/openssl/openssl/issues/33497 | fail-before (hang) / pass-after verified |
+
+Each branch is one commit on top of the upstream base above, independent of
+the others.
 
 Suggested order if you open them one at a time: **2** (integer-overflow
 hardening of widely used public lookup APIs, including a NULL dereference),
-then **1** (a crash in a public API on a documented use).
+then **3** (unbounded loop in key generation on caller-supplied parameters),
+then **1** (a crash in a public API on a documented use). Three open PRs is
+within CONTRIBUTING's "no more than three or four".
 
 ---
 
@@ -226,11 +232,127 @@ ok 12 - === OCSP API TESTS===
 Result: PASS
 ```
 
-**Competing PR search** (all states, 2026-11-04): `is:pr 33498` found nothing.
-Keyword searches `lastpos INT_MAX`, `X509_NAME_get_index_by` and
-`X509V3_get_d2i` (PRs since 2026-05-01) found nothing related. The issue
+**Regression run** (ASan+UBSan, this branch): `make test TESTS="test_x509*
+test_internal_x509 test_ocsp* test_cms test_req test_verify test_v3name
+test_tsa test_lhash test_txt_db" HARNESS_JOBS=4` gave
+`Files=18, Tests=634 ... Result: PASS`.
+
+**Competing PR search** (all states, 2026-11-04, searched twice): `is:pr 33498`
+found nothing. Keyword searches `lastpos INT_MAX`, `X509_NAME_get_index_by`,
+`X509V3_get_d2i` and `OCSP_resp_find` found nothing that fixes this. The issue
 reporter put a suggested fix in the issue body but has not opened a PR. If one
 appears before you submit, compare: this branch also covers `OCSP_resp_find()`.
+
+Related open PR: https://github.com/openssl/openssl/pull/33222 ("OCSP: reject
+ambiguous certificate-status lookups") changes `OCSP_resp_find_status()` and
+adds tests to `test/ocspapitest.c`. It does not touch `OCSP_resp_find()`.
+I cherry-picked its commit (`b3ad3be9a2`) onto this branch and it applied with
+no conflicts.
+
+---
+
+### Fix 3: `EC_KEY_generate_key()` loops forever for a group order of 1
+
+- Branch: `fix/ec-keygen-order-one`
+- SHA: `7c3f3caf893f29a1ef941156304da99b4675203b`
+- Files: `crypto/ec/ec_key.c`, `test/ectest.c`
+- Kind: unbounded loop (100% CPU, never returns) in key generation on
+  parameters an application can build with `EC_GROUP_set_generator()`.
+  The issue reporter says the DER parameter parser rejects an order-1 group,
+  so this is not reachable from parsed input. Hardening, not a vulnerability.
+- Scope: the same loop also never ends for a group of **order 2 with
+  `EC_FLAG_SM2_RANGE`** (the range bound becomes `order - 1 = 1`). The issue
+  does not mention that case; the fix and test cover it. The ECDSA nonce loop in
+  `crypto/ec/ecdsa_ossl.c` is already guarded by `MIN_ECDSA_SIGN_ORDERBITS`
+  (64). The point-blinding loop draws modulo the field, and
+  `EC_GROUP_new_curve_GFp()` requires a field above 3. Neither needs a change.
+- `crypto/ec/ec_key.c` is part of the FIPS module. The "FIPS Check" CI job
+  computes the new checksums and labels the PR. Contributors are not expected
+  to update `providers/fips*.checksum*` by hand.
+
+**PR title:** `ec: fail key generation when the group order leaves no valid key`
+
+**PR body draft:**
+
+```
+ec_generate_key() draws the private key with
+BN_priv_rand_range_ex(priv_key, order, ...) and retries while the result is
+zero. EC_GROUP_set_generator() accepts a group order of 1, and for such a group
+the only value the range can produce is 0, so EC_KEY_generate_key() spins
+forever at 100% CPU. The same happens for a group of order 2 when
+EC_FLAG_SM2_RANGE is set, since the bound is then order - 1.
+
+Such groups have no cryptographic use, but they can be built through the public
+API, and key generation should fail rather than hang on caller-supplied
+parameters. This checks that the range bound is at least 2 before the loop and
+fails with EC_R_INVALID_GROUP_ORDER otherwise. (The ECDSA nonce loop is already
+protected by MIN_ECDSA_SIGN_ORDERBITS.)
+
+A new test (degenerate_order_keygen_test in test/ectest.c) builds an order-1
+group and an order-2 group with the SM2 range flag set, and checks that
+EC_KEY_generate_key() fails for both. Without the change both iterations hang.
+
+Fixes: #33497
+
+##### Checklist
+- [x] tests are added or updated
+```
+
+**Test commands:**
+
+```
+make test TESTS=test_ec V=1
+# fail-before (run directly, because it hangs):
+timeout 60 ./util/wrap.pl test/ectest -test degenerate_order_keygen_test
+```
+
+**Fail-before** (`crypto/ec/ec_key.c` reverted, test kept):
+
+```
+$ time timeout 60 ./util/wrap.pl test/ectest -test degenerate_order_keygen_test
+    # Subtest: degenerate_order_keygen_test
+    1..2
+real	1m0.011s
+user	0m59.337s        <- spinning at 100% CPU until killed
+exit status: 124        <- killed by timeout
+
+$ time timeout 30 ./util/wrap.pl test/ectest -test degenerate_order_keygen_test -iter 2   # SM2 range case
+real	0m30.006s
+user	0m29.583s
+exit status: 124
+```
+
+**Pass-after:**
+
+```
+$ timeout 60 ./util/wrap.pl test/ectest -test degenerate_order_keygen_test
+    # Subtest: degenerate_order_keygen_test
+    1..2
+    ok 1 - iteration 1
+    ok 2 - iteration 2
+ok 1 - degenerate_order_keygen_test
+
+$ make test TESTS=test_ec V=1
+#     ok 20 - degenerate_order_keygen_test
+../../util/wrap.pl ../../test/ectest => 0
+ok 2 - running ectest
+...
+Result: PASS
+```
+
+**Regression run:** see "Fix 3 regression run" at the end of this file.
+
+**Competing PR search** (all states, 2026-11-04, searched twice): `is:pr 33497`
+found nothing. Keyword searches `ec_generate_key`, `EC_KEY_generate_key order`,
+`infinite loop keygen`, `order of 1`, `group order 1`, `BN_priv_rand_range infinite`
+found only old merged or closed PRs and unrelated open ones. The closest is open
+https://github.com/openssl/openssl/pull/33465 ("Handle groups without a
+generator in EC_GROUP_cmp()"), which is a different function.
+
+**Possible follow-up (not on any branch):** the SM2 signing loop in
+`crypto/sm2/sm2_sign.c` (`for (;;)` around `BN_priv_rand_range_ex(k, order, ...)`)
+retries on `r == 0` with no bound, so with a degenerate order it could also
+spin. I did not reproduce this. It is a separate module and would be its own PR.
 
 ---
 
@@ -273,6 +395,15 @@ make -j"$(nproc)" && make test TESTS="test_internal_x509 test_ocsp" V=1   # expe
 git checkout HEAD -- crypto/x509 crypto/ocsp
 ```
 
+For fix 3 (the unfixed code hangs, so run the test binary under `timeout`):
+
+```
+git checkout upstream/master -- crypto/ec/ec_key.c
+make -j"$(nproc)" && timeout 60 ./util/wrap.pl test/ectest -test degenerate_order_keygen_test; echo "exit $?"   # expect exit 124
+git checkout HEAD -- crypto/ec/ec_key.c
+make -j"$(nproc)" && make test TESTS=test_ec V=1                                                              # expect PASS
+```
+
 Full regression run before opening a PR: `make test` (or `make test HARNESS_JOBS=$(nproc)`).
 
 Formatting: CI uses clang-format 21.1.6 (`.pre-commit-config.yaml`). Check with
@@ -304,3 +435,10 @@ All changed files on these branches pass this check.
 - **Text aimed at AI agents**: none in repo or issue text that tried to direct
   an agent. Issue #33498's body has a disclaimer that its root-cause and fix
   sections were LLM-produced. I treated that as data.
+
+## Fix 3 regression run
+
+Pending in the cloud session at the time of this push:
+`make test TESTS="test_ec test_ecdsa test_ecdh test_sm2* test_evp_pkey* test_genec test_ecparam test_internal_ec test_keymgmt_internal test_pkey_check test_ecstress" HARNESS_JOBS=4`
+on `fix/ec-keygen-order-one` (ASan+UBSan). If this section still says
+"pending", the session ended before the run finished, so run it yourself.
