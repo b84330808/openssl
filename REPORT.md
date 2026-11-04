@@ -119,11 +119,35 @@ ok 1 - running lhash_test
 Result: PASS
 ```
 
+**TXT_DB check** (supports the TXT_DB sentence in the commit message). A small
+program reads a two-row `TXT_DB`, calls `TXT_DB_create_index()`, then
+`lh_OPENSSL_STRING_doall(db->index[0], visit)`. Linked against libcrypto
+without the fix:
+
+```
+index created, calling lh_OPENSSL_STRING_doall
+==3522==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x000000000000 ...)
+==3522==Hint: pc points to the zero page.
+```
+
+with the fix:
+
+```
+index created, calling lh_OPENSSL_STRING_doall
+visited 2 rows
+```
+
+(The program is not part of the branch. The new test in `lhash_test.c` covers
+the same code path.)
+
+**Regression run:** see "Fix 1 regression run" at the end of this file.
+
 **Competing PR search** (GitHub search over openssl/openssl, all states,
-2026-11-04): `is:pr 33496` returned nothing. Keyword searches `OPENSSL_LH_doall`,
-`doall_util_fn` and `lhash thunk` (PRs created since 2026-05-01) found no
-related PR. The only hit for `lhash thunk` was #32758, a CHANGES/NEWS update
-that does not touch this.
+2026-11-04, searched twice): `is:pr 33496` returned nothing. Keyword searches
+`OPENSSL_LH_doall`, `doall_util_fn`, `lhash thunk` and `lhash doall` found no
+PR that fixes this. Hits were old merged or closed lhash work (e.g. #23192,
+which introduced the thunks) and the unrelated open #33392 (new intrusive
+hash table).
 
 ---
 
@@ -438,7 +462,35 @@ All changed files on these branches pass this check.
 
 ## Fix 3 regression run
 
+On `fix/ec-keygen-order-one` (ASan+UBSan):
+
+```
+$ make test TESTS="test_ec test_ecdsa test_genec test_ecparam test_internal_ec test_evp_pkey* test_pkey_check test_ecstress" HARNESS_JOBS=4
+03-test_internal_ec.t ok, 15-test_ecparam.t ok, 30-test_evp_pkey_dhkem.t ok,
+30-test_evp_pkey_dparam.t ok, 15-test_genec.t ok, 30-test_evp_pkey_provided.t ok,
+99-test_ecstress.t ok, 91-test_pkey_check.t ok, 15-test_ecdsa.t ok, 15-test_ec.t ok
+Files=10, Tests=40 ... Result: PASS
+
+$ make test TESTS="test_internal_sm2 test_gensm2 test_internal_keymgmt test_evp_pkey_dparam test_evp" HARNESS_JOBS=4
+03-test_internal_sm2.t ok, 02-test_internal_keymgmt.t ok, 15-test_gensm2.t ok,
+30-test_evp_pkey_dparam.t ok, 30-test_evp.t ok
+Files=5, Tests=123 ... Result: PASS
+```
+
+## Fix 1 regression run
+
 Pending in the cloud session at the time of this push:
-`make test TESTS="test_ec test_ecdsa test_ecdh test_sm2* test_evp_pkey* test_genec test_ecparam test_internal_ec test_keymgmt_internal test_pkey_check test_ecstress" HARNESS_JOBS=4`
-on `fix/ec-keygen-order-one` (ASan+UBSan). If this section still says
+`make test TESTS="test_lhash test_internal_* test_ca test_req test_x509 test_cms test_evp test_ssl_old test_sslapi test_provider* test_store test_conf*" HARNESS_JOBS=4`
+on `fix/lhash-doall-null-thunk` (ASan+UBSan). If this section still says
 "pending", the session ended before the run finished, so run it yourself.
+
+## Not done in the cloud session
+
+- No full `make test` run on any branch. Only the targeted subsets listed
+  above. Run the full suite before opening each PR.
+- No plain (non-sanitizer) build. Every result above comes from
+  `-d enable-asan enable-ubsan --strict-warnings` (which also confirms the
+  changes compile cleanly with `-Werror`).
+- No `no-deprecated` build or other configuration variants. The new ectest
+  test uses `EC_KEY_*` the same way the existing, unguarded
+  `check_ec_key_field_public_range_test` does.
