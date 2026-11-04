@@ -33,6 +33,11 @@
 | # | Branch | Head SHA | Upstream issue | Status |
 |---|--------|----------|----------------|--------|
 | 1 | `fix/lhash-doall-null-thunk` | `9ebdf9727e367b23e333ce462fad6cded3e12242` | https://github.com/openssl/openssl/issues/33496 | fail-before / pass-after verified |
+| 2 | `fix/x509-cursor-int-max` | `d400d7558f862ea3b4a044a4de1287cc90d3933b` | https://github.com/openssl/openssl/issues/33498 | fail-before / pass-after verified |
+
+Suggested order if you open them one at a time: **2** (integer-overflow
+hardening of widely used public lookup APIs, including a NULL dereference),
+then **1** (a crash in a public API on a documented use).
 
 ---
 
@@ -116,6 +121,119 @@ that does not touch this.
 
 ---
 
+### Fix 2: lookup cursors overflow at `lastpos == INT_MAX` (x509 and OCSP)
+
+- Branch: `fix/x509-cursor-int-max`
+- SHA: `d400d7558f862ea3b4a044a4de1287cc90d3933b`
+- Files: `crypto/x509/x509name.c`, `crypto/x509/x509_v3.c`,
+  `crypto/x509/x509_att.c`, `crypto/x509/v3_lib.c`, `crypto/ocsp/ocsp_cl.c`,
+  `test/x509_internal_test.c`, `test/ocspapitest.c`
+- Kind: signed integer overflow (UB) in public API cursors, which leads to a
+  NULL dereference (`X509_NAME_get_index_by_*`, `OCSP_resp_find`) or a wrong
+  result (others). The cursor comes from the calling application, not from
+  parsed input, so this is hardening, not a vulnerability.
+- Scope: I grepped `crypto/` for the `lastpos++` / `*idx + 1` / `last++` cursor
+  pattern. The issue lists the four x509 sites. `OCSP_resp_find()` has the same
+  bug and is **not** in the issue; it is fixed in the same commit. Every other
+  `*_get_*_by_*` cursor function is a wrapper around one of these (checked).
+
+**PR title:** `x509, ocsp: avoid lookup cursor overflow at INT_MAX`
+
+**PR body draft:**
+
+```
+The lookup functions that take a "last position" cursor search the entries
+after it and return -1 (or NULL with *idx = -1) when there are none. They all
+compute lastpos + 1 before comparing it with the number of entries, which is
+signed overflow when the caller passes INT_MAX:
+
+- X509_NAME_get_index_by_OBJ() clamps negatives before the increment, so the
+  wrapped INT_MIN reaches sk_X509_NAME_ENTRY_value(), which returns NULL, and
+  the entry is dereferenced (crash, even with one entry).
+- X509v3_get_ext_by_OBJ(), X509v3_get_ext_by_critical() and
+  X509at_get_attr_by_OBJ() clamp after the increment, so the search restarts
+  at 0 and returns the first match instead of -1.
+- X509V3_get_d2i() does the same with *idx + 1 and returns a decoded extension
+  with *idx = 0 instead of NULL / *idx = -1.
+- OCSP_resp_find() increments `last` the same way and dereferences the NULL
+  single response. (Not in the issue; same pattern.)
+
+The fix returns "not found" as soon as the cursor is at or past the last
+entry. The count is an int, so lastpos + 1 cannot overflow after that check.
+Results for every other cursor value are unchanged.
+
+Tests: test_lookup_lastpos_int_max (x509_internal_test) covers
+X509_NAME_get_index_by_NID, X509_get_ext_by_NID, X509_get_ext_by_critical,
+X509_REQ_get_attr_by_NID and X509_get_ext_d2i; test_resp_find_last_int_max
+(ocspapitest) covers OCSP_resp_find. Both fail on master under UBSan and pass
+with the change.
+
+Fixes: #33498
+
+##### Checklist
+- [x] tests are added or updated
+```
+
+**Test commands:**
+
+```
+make test TESTS="test_internal_x509 test_ocsp" V=1
+```
+
+**Fail-before** (library changes reverted, tests kept; ASan+UBSan build with
+`-fno-sanitize-recover=all`, so each test binary stops at the first overflow):
+
+```
+../openssl/crypto/x509/x509name.c:90:17: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+../../util/wrap.pl ../../test/x509_internal_test => 1
+not ok 1 - running x509_internal_test
+...
+../openssl/crypto/ocsp/ocsp_cl.c:227:13: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+../../util/wrap.pl ../../test/ocspapitest ... => 1
+    not ok 1 - running ocspapitest
+not ok 12 - === OCSP API TESTS===
+Result: FAIL
+```
+
+Reverting one file at a time (other fixes kept) shows each site fails on its own:
+
+```
+== only crypto/x509/x509name.c reverted:
+../openssl/crypto/x509/x509name.c:90:17: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+== only crypto/x509/x509_v3.c reverted:
+../openssl/crypto/x509/x509_v3.c:51:12: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+== only crypto/x509/x509_att.c reverted:
+../openssl/crypto/x509/x509_att.c:44:12: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+== only crypto/x509/v3_lib.c reverted:
+../openssl/crypto/x509/v3_lib.c:216:17: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+```
+
+The issue reports that without sanitizers the name lookup crashes with SIGSEGV
+and the ext/attr/d2i lookups return 0 / an object, which the new
+`TEST_int_eq(..., -1)` checks would catch. I only ran the sanitizer build in the
+cloud session, so check this in your plain `./Configure -d` build too.
+
+**Pass-after:**
+
+```
+#     ok 7 - test_lookup_lastpos_int_max
+../../util/wrap.pl ../../test/x509_internal_test => 0
+ok 1 - running x509_internal_test
+...
+#         ok 1 - test_resp_find_last_int_max
+    ok 1 - running ocspapitest
+ok 12 - === OCSP API TESTS===
+Result: PASS
+```
+
+**Competing PR search** (all states, 2026-11-04): `is:pr 33498` found nothing.
+Keyword searches `lastpos INT_MAX`, `X509_NAME_get_index_by` and
+`X509V3_get_d2i` (PRs since 2026-05-01) found nothing related. The issue
+reporter put a suggested fix in the issue body but has not opened a PR. If one
+appears before you submit, compare: this branch also covers `OCSP_resp_find()`.
+
+---
+
 ## Build and test in WSL Ubuntu
 
 ```
@@ -145,6 +263,14 @@ change. For fix 1:
 git checkout upstream/master -- crypto/lhash/lhash.c
 make -j"$(nproc)" && make test TESTS=test_lhash V=1   # expect FAIL
 git checkout HEAD -- crypto/lhash/lhash.c
+```
+
+For fix 2:
+
+```
+git checkout upstream/master -- crypto/x509 crypto/ocsp
+make -j"$(nproc)" && make test TESTS="test_internal_x509 test_ocsp" V=1   # expect FAIL
+git checkout HEAD -- crypto/x509 crypto/ocsp
 ```
 
 Full regression run before opening a PR: `make test` (or `make test HARNESS_JOBS=$(nproc)`).
